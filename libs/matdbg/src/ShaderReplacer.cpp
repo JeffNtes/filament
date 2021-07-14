@@ -18,6 +18,8 @@
 
 #include <backend/DriverEnums.h>
 
+#include <filamat/MaterialBuilder.h>
+
 #include <utils/Log.h>
 
 #include <tsl/robin_map.h>
@@ -26,16 +28,23 @@
 
 #include <string.h>
 
+// TODO: replace these with a filamat utility method that looks like:
+// SpirvBlob glslToSpirv(backend::ShaderModel shaderModel, uint8_t variant,
+//             backend::ShaderType stage, const char* source, size_t sourceLength);
+
+#include <GlslangToSpv.h>
+
+#include "sca/builtinResource.h"
+
 namespace filament {
 namespace matdbg {
 
 using namespace backend;
 using namespace filaflat;
+using namespace filamat;
 using namespace std;
 using namespace tsl;
 using namespace utils;
-
-using filamat::ChunkType;
 
 // Utility class for managing a pair of lists: a list of shader records, and a list of string lines
 // that can be encoded into an index list. Also knows how to read & write the relevant IFF chunks.
@@ -55,7 +64,7 @@ public:
 
     // Replaces the specified shader text with new content.
     void replaceShader(backend::ShaderModel shaderModel, uint8_t variant,
-            backend::ShaderType stage, const char* source, size_t sourceLength);
+            ShaderType stage, const char* source, size_t sourceLength);
 
     bool isEmpty() const { return mStringLines.size() == 0 && mShaderRecords.size() == 0; }
 
@@ -101,20 +110,106 @@ ShaderReplacer::~ShaderReplacer() {
     delete mEditedPackage;
 }
 
-bool ShaderReplacer::replaceShaderSource(backend::ShaderModel shaderModel, uint8_t variant,
-            backend::ShaderType stage, const char* source, size_t sourceLength) {
+// TODO: refactor BEGIN
+static uint32_t shaderVersionFromModel(ShaderModel model) {
+    switch (model) {
+        case ShaderModel::UNKNOWN:
+        case ShaderModel::GL_ES_30:
+            return 300;
+        case ShaderModel::GL_CORE_41:
+            return 410;
+    }
+}
+
+int glslangVersionFromShaderModel(ShaderModel model) {
+    int version = 110;
+    switch (model) {
+        case ShaderModel::UNKNOWN:
+            break;
+        case ShaderModel::GL_ES_30:
+            version = 100;
+            break;
+        case ShaderModel::GL_CORE_41:
+            break;
+    }
+    return version;
+}
+
+EShMessages glslangFlagsFromTargetApi(MaterialBuilder::TargetApi targetApi) {
+    EShMessages msg = EShMessages::EShMsgDefault;
+    if (targetApi == MaterialBuilder::TargetApi::VULKAN) {
+        msg = (EShMessages) (EShMessages::EShMsgVulkanRules | EShMessages::EShMsgSpvRules);
+    }
+    return msg;
+}
+
+inline constexpr MaterialBuilder::TargetApi targetApiFromBackend(Backend backend) noexcept {
+    using TargetApi = MaterialBuilderBase::TargetApi;
+    switch (backend) {
+        case Backend::DEFAULT: return TargetApi::ALL;
+        case Backend::OPENGL:  return TargetApi::OPENGL;
+        case Backend::VULKAN:  return TargetApi::VULKAN;
+        case Backend::METAL:   return TargetApi::METAL;
+        case Backend::NOOP:    return TargetApi::OPENGL;
+    }
+}
+// TODO: refactor END
+
+bool ShaderReplacer::replaceShaderSource(ShaderModel shaderModel, uint8_t variant,
+            ShaderType stage, const char* source, size_t sourceLength) {
     if (!mOriginalPackage.parse()) {
         return false;
     }
 
-    ChunkContainer const& cc = mOriginalPackage;
+    filaflat::ChunkContainer const& cc = mOriginalPackage;
     if (!cc.hasChunk(mMaterialTag) || !cc.hasChunk(mDictionaryTag)) {
         return false;
     }
 
+    using SpirvBlob = std::vector<unsigned int>;
+    SpirvBlob spirv;
+
     if (mDictionaryTag == ChunkType::DictionarySpirv) {
-        slog.e << "SPIR-V editing is not yet supported." << io::endl;
-        return false;
+        using namespace filamat;
+        using namespace glslang;
+
+        assert_invariant(mMaterialTag == ChunkType::MaterialSpirv);
+
+        const EShLanguage shLang = stage == VERTEX ? EShLangVertex : EShLangFragment;
+
+        std::string nullTerminated(source, sourceLength);
+        source = nullTerminated.c_str();
+
+        TShader tShader(shLang);
+        tShader.setStrings(&source, 1);
+
+        MaterialBuilder::TargetApi targetApi = targetApiFromBackend(mBackend);
+        assert_invariant(targetApi == MaterialBuilder::TargetApi::VULKAN);
+
+        const int langVersion = glslangVersionFromShaderModel(shaderModel);
+        const EShMessages msg = glslangFlagsFromTargetApi(targetApi);
+        const bool ok = tShader.parse(&DefaultTBuiltInResource, langVersion, false, msg);
+        if (!ok) {
+            slog.e << "ShaderReplacer parse:\n" << tShader.getInfoLog() << io::endl;
+            return false;
+        }
+
+        TProgram program;
+        program.addShader(&tShader);
+        const bool linkOk = program.link(msg);
+        if (!linkOk) {
+            slog.e << "ShaderReplacer link:\n" << program.getInfoLog() << io::endl;
+            return false;
+        }
+
+        SpvOptions options;
+        options.generateDebugInfo = true;
+        GlslangToSpv(*tShader.getIntermediate(), spirv, &options);
+
+        source = (const char*) spirv.data();
+        sourceLength = spirv.size() * 4;
+
+        slog.i << "Success re-generating SPIR-V. (" << sourceLength << " bytes)" << io::endl;
     }
 
     // Clone all chunks except Dictionary* and Material*.
