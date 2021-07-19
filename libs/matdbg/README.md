@@ -15,14 +15,17 @@
 
 ## Capabilities
 
-TODO: describe matdbg
+matdbg is a library for debugging and live-editing shader code in Filament. At the of time of this
+writing, the following capabilities are supported.
 
 - OpenGL: Displaying and editing GLSL
-- Metal: Displaying and Editing MSL
-- Vulkan: Displaying SPIRV, Displaying and editing transpiled GLSL
+- Metal: Displaying and editing MSL
+- Vulkan: Displaying SPIRV, displaying and editing transpiled GLSL
 
-Even the current app is using Vulkan, it's possible to inspect the Metal shaders, as long as
-the material has been built with Metal support included.
+Note that a given material can be built with multiple backends, even though only one backend
+is active during a session. For example, if the current app is using Vulkan, it is often still
+possible to inspect the Metal shaders, as long as the material has been built with Metal support
+included.
 
 ## Setup for Desktop
 

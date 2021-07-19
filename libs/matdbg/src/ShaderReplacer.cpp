@@ -28,10 +28,6 @@
 
 #include <string.h>
 
-// TODO: replace these with a filamat utility method that looks like:
-// SpirvBlob glslToSpirv(backend::ShaderModel shaderModel, uint8_t variant,
-//             backend::ShaderType stage, const char* source, size_t sourceLength);
-
 #include <GlslangToSpv.h>
 
 #include "sca/builtinResource.h"
@@ -46,8 +42,7 @@ using namespace std;
 using namespace tsl;
 using namespace utils;
 
-// Utility class for managing a pair of lists: a list of shader records, and a list of string lines
-// that can be encoded into an index list. Also knows how to read & write the relevant IFF chunks.
+// Tiny database of shader text that can import / export MaterialTextChunk and DictionaryTextChunk.
 class ShaderIndex {
 public:
     // Consumes a chunk and builds the string list.
@@ -84,6 +79,43 @@ private:
 
     vector<ShaderRecord> mShaderRecords;
     vector<string> mStringLines;
+};
+
+// Unfortunately we do not use FixedCapacityVector for our SPIRV container, because
+// we need to use std::vector to interface with glslang.
+using SpirvBlob = std::vector<unsigned int>;
+
+// Tiny database of data blobs that can import / export MaterialSpirvChunk and DictionarySpirvChunk.
+class BlobIndex {
+public:
+    // Consumes a chunk and builds the blob list.
+    void addDataBlobs(const uint8_t* chunkContent, size_t size);
+
+    // Consumes a chunk and builds the shader records.
+    void addShaderRecords(const uint8_t* chunkContent, size_t size);
+
+    // Produces a chunk holding the blob list.
+    void writeBlobsChunk(ChunkType tag, ostream& stream) const;
+
+    // Produces a chunk holding the shader records.
+    void writeShadersChunk(ChunkType tag, ostream& stream) const;
+
+    // Replaces the specified shader with new content.
+    void replaceShader(backend::ShaderModel shaderModel, uint8_t variant,
+            ShaderType stage, const char* source, size_t sourceLength);
+
+    bool isEmpty() const { return mDataBlobs.size() == 0 && mShaderRecords.size() == 0; }
+
+private:
+    struct ShaderRecord {
+        uint8_t model;
+        uint8_t variant;
+        uint8_t stage;
+        uint32_t blobIndex;
+    };
+
+    vector<ShaderRecord> mShaderRecords;
+    vector<SpirvBlob> mDataBlobs;
 };
 
 ShaderReplacer::ShaderReplacer(Backend backend, const void* data, size_t size) :
@@ -166,50 +198,8 @@ bool ShaderReplacer::replaceShaderSource(ShaderModel shaderModel, uint8_t varian
         return false;
     }
 
-    using SpirvBlob = std::vector<unsigned int>;
-    SpirvBlob spirv;
-
     if (mDictionaryTag == ChunkType::DictionarySpirv) {
-        using namespace filamat;
-        using namespace glslang;
-
-        assert_invariant(mMaterialTag == ChunkType::MaterialSpirv);
-
-        const EShLanguage shLang = stage == VERTEX ? EShLangVertex : EShLangFragment;
-
-        std::string nullTerminated(source, sourceLength);
-        source = nullTerminated.c_str();
-
-        TShader tShader(shLang);
-        tShader.setStrings(&source, 1);
-
-        MaterialBuilder::TargetApi targetApi = targetApiFromBackend(mBackend);
-        assert_invariant(targetApi == MaterialBuilder::TargetApi::VULKAN);
-
-        const int langVersion = glslangVersionFromShaderModel(shaderModel);
-        const EShMessages msg = glslangFlagsFromTargetApi(targetApi);
-        const bool ok = tShader.parse(&DefaultTBuiltInResource, langVersion, false, msg);
-        if (!ok) {
-            slog.e << "ShaderReplacer parse:\n" << tShader.getInfoLog() << io::endl;
-            return false;
-        }
-
-        TProgram program;
-        program.addShader(&tShader);
-        const bool linkOk = program.link(msg);
-        if (!linkOk) {
-            slog.e << "ShaderReplacer link:\n" << program.getInfoLog() << io::endl;
-            return false;
-        }
-
-        SpvOptions options;
-        options.generateDebugInfo = true;
-        GlslangToSpv(*tShader.getIntermediate(), spirv, &options);
-
-        source = (const char*) spirv.data();
-        sourceLength = spirv.size() * 4;
-
-        slog.i << "Success re-generating SPIR-V. (" << sourceLength << " bytes)" << io::endl;
+        return replaceSpirv(shaderModel, variant, stage, source, sourceLength);
     }
 
     // Clone all chunks except Dictionary* and Material*.
@@ -243,6 +233,94 @@ bool ShaderReplacer::replaceShaderSource(ShaderModel shaderModel, uint8_t varian
     if (!shaderIndex.isEmpty()) {
         shaderIndex.replaceShader(shaderModel, variant, stage, source, sourceLength);
         shaderIndex.writeLinesChunk(mDictionaryTag, tstream);
+        shaderIndex.writeShadersChunk(mMaterialTag, tstream);
+    }
+
+    // Copy the new package from the stringstream into a ChunkContainer.
+    const size_t size = tstream.str().size();
+    uint8_t* data = new uint8_t[size];
+    memcpy(data, tstream.str().data(), size);
+    mEditedPackage = new filaflat::ChunkContainer(data, size);
+    return true;
+}
+
+bool ShaderReplacer::replaceSpirv(ShaderModel shaderModel, uint8_t variant,
+            ShaderType stage, const char* source, size_t sourceLength) {
+    using namespace filamat;
+    using namespace glslang;
+
+    filaflat::ChunkContainer const& cc = mOriginalPackage;
+
+    SpirvBlob spirv;
+    assert_invariant(mMaterialTag == ChunkType::MaterialSpirv);
+
+    const EShLanguage shLang = stage == VERTEX ? EShLangVertex : EShLangFragment;
+
+    std::string nullTerminated(source, sourceLength);
+    source = nullTerminated.c_str();
+
+    TShader tShader(shLang);
+    tShader.setStrings(&source, 1);
+
+    MaterialBuilder::TargetApi targetApi = targetApiFromBackend(mBackend);
+    assert_invariant(targetApi == MaterialBuilder::TargetApi::VULKAN);
+
+    const int langVersion = glslangVersionFromShaderModel(shaderModel);
+    const EShMessages msg = glslangFlagsFromTargetApi(targetApi);
+    const bool ok = tShader.parse(&DefaultTBuiltInResource, langVersion, false, msg);
+    if (!ok) {
+        slog.e << "ShaderReplacer parse:\n" << tShader.getInfoLog() << io::endl;
+        return false;
+    }
+
+    TProgram program;
+    program.addShader(&tShader);
+    const bool linkOk = program.link(msg);
+    if (!linkOk) {
+        slog.e << "ShaderReplacer link:\n" << program.getInfoLog() << io::endl;
+        return false;
+    }
+
+    SpvOptions options;
+    options.generateDebugInfo = true;
+    GlslangToSpv(*tShader.getIntermediate(), spirv, &options);
+
+    source = (const char*) spirv.data();
+    sourceLength = spirv.size() * 4;
+
+    slog.i << "Success re-generating SPIR-V. (" << sourceLength << " bytes)" << io::endl;
+
+    // Clone all chunks except Dictionary* and Material*.
+    stringstream sstream(string((const char*) cc.getData(), cc.getSize()));
+    stringstream tstream;
+    BlobIndex shaderIndex;
+    {
+        uint64_t type;
+        uint32_t size;
+        vector<uint8_t> content;
+        while (sstream) {
+            sstream.read((char*) &type, sizeof(type));
+            sstream.read((char*) &size, sizeof(size));
+            content.resize(size);
+            sstream.read((char*) content.data(), size);
+            if (ChunkType(type) == mDictionaryTag) {
+                shaderIndex.addDataBlobs(content.data(), size);
+                continue;
+            }
+            if (ChunkType(type) == mMaterialTag) {
+                shaderIndex.addShaderRecords(content.data(), size);
+                continue;
+            }
+            tstream.write((char*) &type, sizeof(type));
+            tstream.write((char*) &size, sizeof(size));
+            tstream.write((char*) content.data(), size);
+        }
+    }
+
+    // Append the new chunks for Dictionary* and Material*.
+    if (!shaderIndex.isEmpty()) {
+        shaderIndex.replaceShader(shaderModel, variant, stage, source, sourceLength);
+        shaderIndex.writeBlobsChunk(mDictionaryTag, tstream);
         shaderIndex.writeShadersChunk(mMaterialTag, tstream);
     }
 
@@ -428,6 +506,99 @@ void ShaderIndex::encodeShadersToIndices() {
     }
 }
 
+void BlobIndex::addDataBlobs(const uint8_t* chunkContent, size_t size) {
+    const uint32_t compression = *((const uint32_t*) chunkContent++);
+    const uint32_t blobCount = *((const uint32_t*) chunkContent++);
+    mDataBlobs.resize(blobCount);
+    const uint8_t* ptr = chunkContent;
+    for (uint32_t i = 0; i < blobCount; i++) {
+        const uint64_t byteCount = *((const uint64_t*) ptr);
+        ptr += sizeof(uint64_t);
+        mDataBlobs[i].resize(byteCount);
+        memcpy(mDataBlobs[i].data(), ptr, byteCount);
+        ptr += byteCount;
+    }
+}
+
+void BlobIndex::addShaderRecords(const uint8_t* chunkContent, size_t size) {
+    stringstream stream(string((const char*) chunkContent, size));
+    uint64_t recordCount;
+    stream.read((char*) &recordCount, sizeof(recordCount));
+    mShaderRecords.resize(recordCount);
+    for (auto& record : mShaderRecords) {
+        stream.read((char*) &record.model, sizeof(ShaderRecord::model));
+        stream.read((char*) &record.variant, sizeof(ShaderRecord::variant));
+        stream.read((char*) &record.stage, sizeof(ShaderRecord::stage));
+        stream.read((char*) &record.blobIndex, sizeof(ShaderRecord::blobIndex));
+    }
+}
+
+void BlobIndex::writeBlobsChunk(ChunkType tag, ostream& stream) const {
+    // First perform a prepass to compute chunk size.
+    uint32_t size = sizeof(uint32_t) + sizeof(uint32_t);
+    for (const auto& blob : mDataBlobs) {
+        size += sizeof(uint64_t);
+        size += blob.size();
+    }
+
+    // Serialize the chunk.
+    const uint64_t type = tag;
+    stream.write((char*) &type, sizeof(type));
+    stream.write((char*) &size, sizeof(size));
+    const uint32_t count = mDataBlobs.size();
+    stream.write((char*) &count, sizeof(count));
+    for (const auto& blob : mDataBlobs) {
+        const uint64_t byteCount = blob.size();
+        stream.write((char*) &byteCount, sizeof(byteCount));
+        stream.write((char*) blob.data(), blob.size());
+    }
+}
+
+void BlobIndex::writeShadersChunk(ChunkType tag, ostream& stream) const {
+    // First perform a prepass to compute chunk size.
+    uint32_t size = sizeof(uint64_t);
+    for (const auto& record : mShaderRecords) {
+        size += sizeof(ShaderRecord::model);
+        size += sizeof(ShaderRecord::variant);
+        size += sizeof(ShaderRecord::stage);
+        size += sizeof(ShaderRecord::blobIndex);
+    }
+    for (const auto& record : mShaderRecords) {
+        size += sizeof(uint64_t);
+        size += mDataBlobs[record.blobIndex].size();
+    }
+
+    // Serialize the chunk.
+    uint64_t type = tag;
+    stream.write((char*) &type, sizeof(type));
+    stream.write((char*) &size, sizeof(size));
+    const uint64_t recordCount = mShaderRecords.size();
+    stream.write((char*) &recordCount, sizeof(recordCount));
+    for (const auto& record : mShaderRecords) {
+        stream.write((char*) &record.model, sizeof(ShaderRecord::model));
+        stream.write((char*) &record.variant, sizeof(ShaderRecord::variant));
+        stream.write((char*) &record.stage, sizeof(ShaderRecord::stage));
+        stream.write((char*) &record.blobIndex, sizeof(ShaderRecord::blobIndex));
+    }
+    for (const auto& record : mShaderRecords) {
+        const uint64_t byteCount = mDataBlobs[record.blobIndex].size();
+        stream.write((char*) &byteCount, sizeof(byteCount));
+        stream.write((char*) mDataBlobs[record.blobIndex].data(), byteCount);
+    }
+}
+
+void BlobIndex::replaceShader(backend::ShaderModel shaderModel, uint8_t variant,
+            backend::ShaderType stage, const char* source, size_t sourceLength) {
+    const uint8_t model = (uint8_t) shaderModel;
+    for (auto& record : mShaderRecords) {
+        if (record.model == model && record.variant == variant && record.stage == stage) {
+            SpirvBlob& blob = mDataBlobs[record.blobIndex];
+            blob.resize(sourceLength);
+            memcpy(blob.data(), source, sourceLength);
+            break;
+        }
+    }
+}
 
 } // namespace matdbg
 } // namespace filament
